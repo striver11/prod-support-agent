@@ -1,0 +1,6 @@
+.git-old/
+node_modules/
+.env
+**/chroma-data/
+*.log
+.DS_Store

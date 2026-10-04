@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "servicenow-agent": "file:../.."
+  }
+}

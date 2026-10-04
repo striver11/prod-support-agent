@@ -1,0 +1,40 @@
+name: ServiceNow Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Tell the agent what to do"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: |
+          cd agent/servicenow-agent
+          npm install
+
+      - name: Run ServiceNow Agent
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SNOW_INSTANCE: ${{ secrets.SNOW_INSTANCE }}
+          SNOW_USERNAME: ${{ secrets.SNOW_USERNAME }}
+          SNOW_PASSWORD: ${{ secrets.SNOW_PASSWORD }}
+          USER_COMMAND: ${{ github.event.inputs.command }}
+        run: |
+          cd agent/servicenow-agent
+          node index.js

@@ -1,0 +1,11 @@
+{
+  "name": "servicenow-agent",
+  "version": "1.0.0",
+  "description": "Gemini-powered agent for ServiceNow",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file=../.env index.js",
+    "start:jira": "node --env-file=../.env jira-agent.js"
+  }
+}

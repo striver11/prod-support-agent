@@ -1,0 +1,12 @@
+# Mac system files
+.DS_Store
+.DS_Store?
+._*
+
+# Node
+node_modules/
+npm-debug.log
+
+# Environment files
+.env
+*.env
