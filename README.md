@@ -3,15 +3,15 @@
 This repository contains two Node.js command-line agents:
 
 - The ServiceNow agent uses Gemini to create, update, close, or retrieve ServiceNow Catalog Tasks from a natural-language command.
-- The Jira agent uses Gemini to draft and create a Jira Story or Bug from email text and an existing ServiceNow Catalog Task.
+- The Jira agent uses Gemini to draft and create a Jira Story or Bug from email text and an existing ServiceNow Incident or Catalog Task.
 
-The Jira flow currently takes email text from configuration or the command line. It does not connect to an email inbox.
+The Jira flow accepts email text from configuration or the command line. The Outlook watcher invokes it automatically only for new Inbox subjects reporting an `INC...` incident assigned to `Infra Services` (case insensitive).
 
 ## Requirements
 
 - Node.js 22 or later
 - Python 3 for running Chroma locally without Docker
-- A ServiceNow instance with API access to the `sc_task` table; vector indexing also requires read access to `kb_knowledge`
+- A ServiceNow instance with read access to the `incident` table for Outlook notifications, and API access to `sc_task` for Catalog Tasks; vector indexing also requires read access to `kb_knowledge`
 - For ServiceNow commands and Jira creation: a Gemini API key
 - For Jira creation: a Jira Cloud API token
 
@@ -94,7 +94,7 @@ The application is organized under `agent/`: `agent/servicenow-agent/` contains 
    Then, from the repository root, start Chroma and leave this terminal running:
 
    ```powershell
-   chroma run --path .\agent\vectorDB\chroma-data --host 127.0.0.1 --port 8000
+   npm.cmd --prefix agent/vectorDB run start:chroma
    ```
 
 3. Install [Ollama](https://ollama.com/) and pull a chat model and embedding model:
@@ -128,33 +128,91 @@ The Jira flow requires the Chroma server and Ollama to be running, and the index
 npm --prefix agent/servicenow-agent run start:jira
 ```
 
-It retrieves the ServiceNow task, searches the Chroma index, uses Ollama for automatic Story/Bug classification, sends the email, task, and matching articles to Gemini to draft the Jira summary and description, and creates the selected Jira issue type. If `SNOW_TICKET_NUMBER` is omitted, it tries to find an `SCTASK` number in `EMAIL_TEXT`. The current ServiceNow task lookup only searches the `sc_task` table. Every successful run creates a new Jira issue; there is no duplicate-email detection yet.
+It retrieves the ServiceNow ticket, searches the Chroma index, uses Ollama for automatic Story/Bug classification, sends the email, ticket, and matching articles to Gemini to draft the Jira summary and description, and creates the selected Jira issue type. For manual runs, if `SNOW_TICKET_NUMBER` is omitted, it tries to find an `INC` or `SCTASK` number in `EMAIL_TEXT`. Incident numbers query the `incident` table; Catalog Task numbers query `sc_task`. Every successful manual run creates a new Jira issue; duplicate-email tracking is provided by the Outlook watcher below.
 
 Jira Cloud authentication uses your Atlassian account email and an API token. Create a token in your Atlassian account security settings. Keep it private.
 
 ## Email and Knowledge-Base Integration
 
-Email intake remains future integration work. The email component should provide the message body and the related ServiceNow Catalog Task number. The Jira agent exports a function for such integrations:
+### Automatic Outlook incident intake
+
+`readmail.js` is the JavaScript replacement for the subject-printing `readmail.py`. It uses Microsoft Graph device-code sign-in and checks the Inbox every 60 seconds. Only subjects matching this assignment format trigger the agents:
+
+```text
+[Action Required]: Incident INC838294 has been assigned to Infra Services
+```
+
+The watcher extracts `INC838294` from the subject and requires the assigned group to be exactly `Infra Services`, ignoring case and extra whitespace. Subjects for other groups, without an INC number, or containing only a generic incident keyword are skipped. The full subject is passed as `emailText` to `createJiraFromEmail`. Mail bodies are not read. The Jira agent retrieves the corresponding ServiceNow Incident and drafts the Jira issue using the subject, incident details, and knowledge articles.
+
+Add the Outlook settings to `agent/.env`, alongside the existing Jira, ServiceNow, and Gemini settings:
+
+```dotenv
+OUTLOOK_CLIENT_ID=your-microsoft-app-client-id
+OUTLOOK_TENANT=common
+```
+
+Use the Microsoft app registration from the Python reader, with public client/device-code authentication enabled and delegated Microsoft Graph `Mail.ReadBasic` permission. `OUTLOOK_TENANT` can be your tenant ID, `organizations`, `consumers`, or `common`, as appropriate for the registration.
+
+With the existing Jira dependencies and services configured above, run from the repository root:
+
+```powershell
+npm --prefix agent/servicenow-agent run start:mail
+```
+
+Alternatively:
+
+```powershell
+node readmail.js
+```
+
+The watcher automatically loads `agent/.env` relative to its script location. Environment variables already set in the terminal take precedence.
+
+The watcher opens the Microsoft sign-in page in your default browser automatically. Enter the device code printed in the terminal when prompted, then sign in to the mailbox. If the browser cannot open, use the printed URL manually. Leave the watcher running; stop with Ctrl+C. Tokens refresh in memory, and a restart requires signing in again.
+
+The mail watcher always uses the INC number extracted from the assignment subject. It does not use `SNOW_TICKET_NUMBER` or `EMAIL_TEXT` from `.env`; those settings remain available for manual Jira commands. The ServiceNow account must be able to read the matching record in the `incident` table.
+
+On its first run, the watcher skips mail received before startup. It saves the Inbox cursor, seen message IDs, and pending incident subjects in the Git-ignored `outlook-jira.state.json`. Completed messages are skipped across restarts, and failed submissions retry on later polls without blocking other queued messages. Keep this file to preserve progress. It is separate from the Python reader's state. Use `--state-file path` for a separate mailbox, and run only one watcher per mailbox/state file. Custom state files contain subjects and should also be Git-ignored.
+
+Each completed Inbox check logs counts for new emails read, subjects containing the incident keyword, matching Infra Services assignments, existing mail skipped, and queued messages. Counts cover all pages of that check and exclude duplicate/deleted messages. An idle check reports zero new emails. For example:
+
+```text
+Inbox check: new emails read=4, incident emails=3, Infra Services matches=1, existing emails skipped=0, queued=1.
+Processing queued email for INC838294 (attempt 1).
+```
+
+On restart, saved queued emails are rechecked against the assignment filter; older generic incident subjects are skipped without calling any agents. Eligible failures remain queued and can retry even when there is no new mail. Logs identify retries and their attempt number. Mail arriving while the watcher was stopped is picked up from the saved cursor on restart.
+
+There is a small duplicate risk if Jira creates an issue but the response is lost or the process stops before saving success; local state does not provide an atomic transaction with Jira.
+
+Run the automated watcher checks without contacting Outlook or Jira:
+
+```powershell
+node --test readmail.test.js agent/servicenow-agent/servicenow.test.js
+```
+
+### Calling the Jira agent from other integrations
+
+The Jira agent exports a function for email integrations:
 
 ```js
 import { createJiraFromEmail } from "./agent/servicenow-agent/jira-agent.js";
 
 const issue = await createJiraFromEmail({
   emailText: email.textBody,
-  serviceNowTicketNumber: email.serviceNowTaskNumber,
+  serviceNowTicketNumber: email.serviceNowTicketNumber,
   issueType: classification.issueType,
 });
 ```
 
-When `issueType` is omitted, the agent retrieves relevant articles from Chroma and classifies the request with Ollama. Retrieved articles are also provided to Gemini as supporting context for the Jira draft. The eventual email trigger should prevent duplicate processing, for example by tracking the email provider's message ID.
+When `issueType` is omitted, the agent retrieves relevant articles from Chroma and classifies the request with Ollama. Retrieved articles are also provided to Gemini as supporting context for the Jira draft. The Outlook watcher tracks Microsoft's immutable message IDs to avoid resubmitting completed messages.
 
 ## Troubleshooting
 
-- **ServiceNow task not found:** Confirm the ticket exists in the same instance and is a Catalog Task (`SCTASK...`); Incidents (`INC...`) are not supported by the current lookup.
-- **ServiceNow authentication or access error:** Verify the instance hostname, username, password, and API access to `sc_task`.
+- **ServiceNow ticket not found:** Confirm the ticket exists in the configured instance. `INC...` numbers query the `incident` table; `SCTASK...` numbers query `sc_task`.
+- **ServiceNow authentication or access error:** Verify the instance hostname, username, password, and API access to the relevant `incident` or `sc_task` table.
 - **Jira project or issue-type error:** Check the project key and confirm that the project supports the selected issue type.
 - **Gemini API error:** Verify the API key and model. A `503` may be temporary; retry after a short wait.
-- **Ollama or Chroma connection error:** Confirm Ollama and the Chroma server are running, the configured models have been pulled, and the ServiceNow knowledge articles have been indexed.
+- **Ollama or Chroma connection error:** Confirm Ollama and the Chroma server are running, the configured models have been pulled, and the ServiceNow knowledge articles have been indexed. On Windows, start Chroma from the repository root with `npm.cmd --prefix agent/vectorDB run start:chroma` and leave it running. Check `http://127.0.0.1:8000/api/v2/heartbeat`. If the index is empty, run `node --env-file=agent/.env agent/vectorDB/index.js`. The mail watcher retries queued incidents automatically once the services recover.
 - **ServiceNow knowledge-base access error:** Verify the account can read published records from the `kb_knowledge` table.
 - **Credentials:** Never commit `.env` or paste API tokens and passwords into chat or issue trackers.
 
@@ -172,4 +230,6 @@ agent/vectorDB/knowledge-base.js         Ollama embeddings and Chroma vector sea
 agent/vectorDB/classifier.js             Ollama Story/Bug classification
 agent/vectorDB/package.json              Chroma client dependency
 agent/.env                              Local, Git-ignored configuration
+readmail.js                             Outlook incident subject watcher and Jira trigger
+readmail.test.js                        Offline watcher tests
 ```

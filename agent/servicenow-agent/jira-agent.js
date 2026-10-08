@@ -4,7 +4,7 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
 const emailText = process.env.EMAIL_TEXT || process.env.USER_COMMAND || process.argv.slice(2).join(' ').trim();
 const serviceNowTicketNumber = process.env.SNOW_TICKET_NUMBER
-  || emailText.match(/\bSCTASK\d+\b/i)?.[0];
+  || emailText.match(/\b(?:INC|SCTASK)\d+\b/i)?.[0];
 const configuredIssueType = process.env.JIRA_ISSUE_TYPE;
 
 function parseIssue(text) {
@@ -72,8 +72,8 @@ export async function createJiraFromEmail({ emailText: sourceEmail, serviceNowTi
   }
 
   console.log(`Reading email and ServiceNow ticket ${ticketNumber}...`);
-  const { getTask } = await import('./servicenow.js');
-  const serviceNowTicket = await getTask({ number: ticketNumber });
+  const { getServiceNowTicket } = await import('./servicenow.js');
+  const serviceNowTicket = await getServiceNowTicket({ number: ticketNumber });
   const { classifyEmail } = await import('../vectorDB/classifier.js');
   const { searchKnowledgeBase } = await import('../vectorDB/knowledge-base.js');
   const knowledgeArticles = await searchKnowledgeBase(
@@ -100,7 +100,9 @@ export async function createJiraFromEmail({ emailText: sourceEmail, serviceNowTi
     serviceNowTicket,
     knowledgeArticles: articleContext,
   });
-  console.log(`Ollama classified this request as a Jira ${selectedIssueType}.`);
+  console.log(issueType
+    ? `Using configured Jira issue type: ${selectedIssueType}.`
+    : `Ollama classified this request as a Jira ${selectedIssueType}.`);
   const issueDraft = await understandEmail(
     sourceEmail,
     serviceNowTicket,
@@ -116,9 +118,9 @@ async function main() {
   if (!emailText) {
     throw new Error('Provide the email body with EMAIL_TEXT, USER_COMMAND, or text arguments');
   }
-  const ticketNumber = serviceNowTicketNumber || emailText.match(/\bSCTASK\d+\b/i)?.[0];
+  const ticketNumber = serviceNowTicketNumber || emailText.match(/\b(?:INC|SCTASK)\d+\b/i)?.[0];
   if (!ticketNumber) {
-    throw new Error('Provide SNOW_TICKET_NUMBER or include an SCTASK number in the email text');
+    throw new Error('Provide SNOW_TICKET_NUMBER or include an INC or SCTASK number in the email text');
   }
 
   const created = await createJiraFromEmail({

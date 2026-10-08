@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node --env-file=../.env index.js",
-    "start:jira": "node --env-file=../.env jira-agent.js"
+    "start:jira": "node --env-file=../.env jira-agent.js",
+    "start:mail": "node --env-file=../.env ../../readmail.js"
   }
 }

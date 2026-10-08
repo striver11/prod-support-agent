@@ -4,3 +4,5 @@ node_modules/
 **/chroma-data/
 *.log
 .DS_Store
+mailRead.state.json*
+outlook-jira.state.json*

@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "description": "Ollama embeddings and Chroma knowledge-base retrieval for the Jira agent",
+  "scripts": {
+    "start:chroma": "py -c \"from chromadb.cli.cli import app; app()\" run --path ./chroma-data --host 127.0.0.1 --port 8000"
+  },
   "dependencies": {
     "chromadb": "^3.0.0"
   }

@@ -117,6 +117,33 @@ export async function getTask({ number }) {
   };
 }
 
+// Email assignment notifications refer to Incident records, not Catalog Tasks.
+export async function getIncident({ number }) {
+  const normalized = String(number || '').trim().toUpperCase();
+  if (!/^INC\d+$/.test(normalized)) throw new Error('A valid INC incident number is required');
+  const params = new URLSearchParams({
+    sysparm_query: `number=${normalized}`,
+    sysparm_limit: '1',
+    sysparm_display_value: 'true',
+    sysparm_exclude_reference_link: 'true',
+    sysparm_fields: 'sys_id,number,short_description,description,state,priority,assignment_group',
+  });
+  const search = await snowFetch(`/incident?${params}`);
+  if (!search?.length) throw new Error(`Incident ${normalized} not found in ServiceNow`);
+  const incident = search[0];
+  return {
+    ...incident,
+    link: `https://${INSTANCE}/nav_to.do?uri=incident.do?sys_id=${incident.sys_id}`,
+  };
+}
+
+export async function getServiceNowTicket({ number }) {
+  const normalized = String(number || '').trim().toUpperCase();
+  if (/^INC\d+$/.test(normalized)) return getIncident({ number: normalized });
+  if (/^SCTASK\d+$/.test(normalized)) return getTask({ number: normalized });
+  throw new Error('A ServiceNow INC or SCTASK ticket number is required');
+}
+
 async function getPublishedKnowledgeArticlesFromTable(table, fields) {
   const pageSize = 100;
   const articles = [];
