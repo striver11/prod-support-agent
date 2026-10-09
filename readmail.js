@@ -6,7 +6,7 @@ const { setTimeout: sleep } = require('node:timers/promises');
 const { execFile } = require('node:child_process');
 
 const GRAPH_URL = 'https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta';
-const SCOPE = 'https://graph.microsoft.com/Mail.ReadBasic offline_access';
+const SCOPE = 'https://graph.microsoft.com/Mail.Read offline_access';
 const POLL_MS = 60_000;
 
 class StateError extends Error {}
@@ -177,7 +177,8 @@ async function loadState(file, clientId, tenant) {
       || typeof state.initialized !== 'boolean'
       || !Array.isArray(state.pending)
       || !state.pending.every(message => message && typeof message.id === 'string'
-        && typeof message.subject === 'string')
+        && typeof message.subject === 'string'
+        && (message.body === undefined || typeof message.body === 'string'))
       || (state.cursor !== null && !validDeltaUrl(state.cursor))) {
     throw new StateError(`Invalid state file: ${file}`);
   }
@@ -258,20 +259,46 @@ async function pollInbox(auth, state, stateFile, request = jsonRequest) {
   }
 }
 
-async function submitIncident({ subject }, createIssue) {
+async function readMessageBody(auth, messageId, request = jsonRequest) {
+  // Fetch only matching messages, so saved delta cursors need no migration.
+  const url = `https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(messageId)}?${new URLSearchParams({ $select: 'body' })}`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const { status, result } = await request(url, {
+      headers: {
+        Authorization: `Bearer ${await auth.token()}`,
+        Prefer: 'IdType="ImmutableId", outlook.body-content-type="text"',
+      },
+    });
+    if (status === 401 && attempt === 0) {
+      auth.expiresAt = 0;
+      continue;
+    }
+    if (status === 403) {
+      throw new Error('Cannot read email body. Grant delegated Microsoft Graph Mail.Read permission and sign in again.');
+    }
+    if (status !== 200) throw new Error(`Could not read email body: ${result?.error?.message || `HTTP ${status}`}`);
+    if (typeof result?.body?.content !== 'string' || result.body.contentType?.toLowerCase() !== 'text') {
+      throw new Error('Microsoft did not return the requested plain-text email body.');
+    }
+    return result.body.content;
+  }
+}
+
+async function submitIncident({ subject, body }, createIssue) {
   const assignment = parseIncidentAssignment(subject);
   if (!assignment) {
     throw new Error('Only incident assignment emails for Infra Services can trigger the Jira agent.');
   }
+  if (typeof body !== 'string') throw new Error('Email body must be read before triggering the Jira agent.');
   createIssue ||= (await import('./agent/servicenow-agent/jira-agent.js')).createJiraFromEmail;
   return createIssue({
-    emailText: subject,
+    emailText: `Subject: ${subject}\n\n${body}`,
     serviceNowTicketNumber: assignment.incidentNumber,
     issueType: process.env.JIRA_ISSUE_TYPE || undefined,
   });
 }
 
-async function processPending(state, stateFile, submit = submitIncident) {
+async function processPending(state, stateFile, submit = submitIncident, readBody) {
   for (const message of [...state.pending]) {
     // Recheck saved messages too: earlier versions queued any incident keyword.
     const assignment = parseIncidentAssignment(message.subject);
@@ -286,8 +313,13 @@ async function processPending(state, stateFile, submit = submitIncident) {
     console.log(`Processing queued email for ${assignment.incidentNumber} (attempt ${message.attempts}). ${message.attempts > 1 ? 'Retrying a previous failure; this is not a newly received email.' : ''}`.trim());
     let created;
     try {
+      if (typeof message.body !== 'string' && readBody) {
+        message.body = await readBody(message.id);
+        await saveState(stateFile, state);
+      }
       created = await submit(message);
     } catch (error) {
+      if (error instanceof StateError) throw error;
       console.error(`Jira submission failed for ${JSON.stringify(message.subject)}; queued for retry: ${error.message}`);
       continue;
     }
@@ -330,12 +362,12 @@ async function main() {
       if (error instanceof StateError) throw error;
       console.error(`Inbox check failed: ${error.message}`);
     }
-    await processPending(state, stateFile);
+    await processPending(state, stateFile, submitIncident, id => readMessageBody(auth, id));
     await sleep(Math.max(0, nextPoll - Date.now()));
   }
 }
 
-module.exports = { GraphAuth, isIncident, parseIncidentAssignment, loadState, pollInbox, processPending, submitIncident, validDeltaUrl };
+module.exports = { GraphAuth, isIncident, parseIncidentAssignment, loadState, pollInbox, processPending, readMessageBody, submitIncident, validDeltaUrl };
 
 if (require.main === module) {
   main().catch(error => {

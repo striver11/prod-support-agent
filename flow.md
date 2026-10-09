@@ -362,13 +362,13 @@ To send new Outlook incident subjects to the Jira agent automatically, add `OUTL
 npm --prefix agent\servicenow-agent run start:mail
 ```
 
-The watcher opens the Microsoft sign-in page automatically; enter the code printed in the terminal. It checks every 60 seconds and only triggers agents for subjects such as `[Action Required]: Incident INC838294 has been assigned to Infra Services`. Matching is case insensitive, and the group must be exactly `Infra Services`. It extracts the `INC...` number from the subject and reads that record from ServiceNow's `incident` table. The mail watcher does not use `SNOW_TICKET_NUMBER` or `EMAIL_TEXT` from `.env`. Jira, ServiceNow, Gemini, Ollama, and Chroma setup remains as described above; the ServiceNow account also needs read access to `incident`.
+The watcher opens the Microsoft sign-in page automatically; enter the code printed in the terminal. It checks every 60 seconds and only triggers agents for subjects such as `[Action Required]: Incident INC838294 has been assigned to Infra Services`. Matching is case insensitive, and the group must be exactly `Infra Services`. It reads the matching email's subject and full plain-text body and searches the existing knowledge-article vector index using that content. The `INC...` number is retained only as a reference; the direct ServiceNow ticket lookup is commented out for now. The mail watcher does not use `SNOW_TICKET_NUMBER` or `EMAIL_TEXT` from `.env`. Configure delegated Microsoft Graph `Mail.Read` permission and consent on the next sign-in to allow body reads. Jira, Gemini, Ollama, and Chroma setup remains as described above; ServiceNow access is needed when updating the knowledge-article index.
 
 Existing mail is skipped on the first run. Each Inbox check logs the number of new emails read, incident subjects, and matching Infra Services assignments. Progress and failed submissions are saved in `outlook-jira.state.json`; preserve it across restarts and run one watcher per mailbox. Saved emails are rechecked against the group filter, and retry logs distinguish previous failures from new mail. See README.md for authentication setup, retry behavior, and state-file details.
 
 ## Manual invocation
 
-The Jira agent can use a ServiceNow ticket and email/request information to determine the Jira issue to create.
+The Jira agent uses email/request content and similar indexed knowledge articles to determine the Jira issue to create. Direct ServiceNow ticket lookup is temporarily disabled.
 
 Start the Jira agent from the project root:
 
@@ -376,14 +376,7 @@ Start the Jira agent from the project root:
 npm --prefix agent\servicenow-agent run start:jira
 ```
 
-The application may ask for inputs such as:
-
-```text
-SNOW TICKET NUMBER:
-SCTASK0010002
-```
-
-And:
+Provide email content using `EMAIL_TEXT` in `agent/.env` or the command line. A ServiceNow ticket number is not required. For example:
 
 ```text
 EMAIL TEXT:
@@ -394,57 +387,18 @@ Several users report that the USB port on their PC stopped working after the lat
 
 # 11. Example End-to-End Flow
 
-The overall flow is:
-
 ```text
-                    ┌──────────────────────┐
-                    │  Email / User Input  │
-                    └──────────┬───────────┘
-                               │
-                               ▼
-                    ┌──────────────────────┐
-                    │   ServiceNow Agent   │
-                    └──────────┬───────────┘
-                               │
-                               ▼
-                    ┌──────────────────────┐
-                    │ ServiceNow Knowledge │
-                    │      Articles        │
-                    └──────────┬───────────┘
-                               │
-                               ▼
-                    ┌──────────────────────┐
-                    │      ChromaDB        │
-                    │   Vector Database    │
-                    └──────────┬───────────┘
-                               │
-                               ▼
-                    ┌──────────────────────┐
-                    │   Ollama Embeddings  │
-                    │ nomic-embed-text     │
-                    └──────────────────────┘
-
-
-Email / Request
-       │
-       ▼
-┌─────────────────────┐
-│ Ollama llama3.2:3b  │
-│                     │
-│ Story or Bug?       │
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│     Jira Agent      │
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│    Jira Project     │
-│       KAN           │
-└─────────────────────┘
+Matching Infra Services email
+    -> Read subject and plain-text body
+    -> Ollama embedding of email content
+    -> Similarity search in Chroma's existing knowledge-article index
+    -> Print related knowledge articles
+    -> Ollama Story/Bug classification (or configured JIRA_ISSUE_TYPE)
+    -> Gemini drafts the Jira issue from email and article context
+    -> Create Jira issue
 ```
+
+Direct ServiceNow ticket lookup is temporarily commented out. Knowledge articles are loaded from ServiceNow only when the separate indexing command is run.
 
 ---
 

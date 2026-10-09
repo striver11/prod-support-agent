@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const { mkdtemp, rm } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
-const { isIncident, parseIncidentAssignment, loadState, pollInbox, processPending, submitIncident, validDeltaUrl, GraphAuth } = require('./readmail.js');
+const { isIncident, parseIncidentAssignment, loadState, pollInbox, processPending, readMessageBody, submitIncident, validDeltaUrl, GraphAuth } = require('./readmail.js');
 
 const delta = 'https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta';
 const auth = { token: async () => 'test-token' };
@@ -52,13 +52,15 @@ test('Jira receives the subject INC number and never falls back to the configure
   const calls = [];
   const createIssue = async input => { calls.push(input); return { key: 'TEST-1' }; };
   const subject = incidentSubject('inc838294');
-  await submitIncident({ subject }, createIssue);
-  assert.deepEqual(calls[0], { emailText: subject, serviceNowTicketNumber: 'INC838294', issueType: 'Bug' });
+  const body = 'The application is unavailable for all users after deployment.';
+  await submitIncident({ subject, body }, createIssue);
+  assert.deepEqual(calls[0], { emailText: `Subject: ${subject}\n\n${body}`, serviceNowTicketNumber: 'INC838294', issueType: 'Bug' });
   delete process.env.JIRA_ISSUE_TYPE;
-  await submitIncident({ subject: incidentSubject('INC123') }, createIssue);
+  await submitIncident({ subject: incidentSubject('INC123'), body: '' }, createIssue);
   assert.deepEqual(calls[1], {
-    emailText: incidentSubject('INC123'), serviceNowTicketNumber: 'INC123', issueType: undefined,
+    emailText: `Subject: ${incidentSubject('INC123')}\n\n`, serviceNowTicketNumber: 'INC123', issueType: undefined,
   });
+  await assert.rejects(submitIncident({ subject }, createIssue), /Email body must be read/);
   await assert.rejects(submitIncident({ subject: 'Incident: network outage' }, createIssue), /Only incident assignment/);
   await assert.rejects(submitIncident({ subject: incidentSubject('INC123', 'Other Group') }, createIssue), /Only incident assignment/);
   delete process.env.SNOW_TICKET_NUMBER;
@@ -257,7 +259,53 @@ test('expired access tokens refresh without interactive sign-in', async t => {
     assert.match(url, /\/tenant\/oauth2\/v2.0\/token$/);
     assert.equal(options.body.get('grant_type'), 'refresh_token');
     assert.equal(options.body.get('refresh_token'), 'refresh');
+    assert.equal(options.body.get('scope'), 'https://graph.microsoft.com/Mail.Read offline_access');
     return { status: 200, json: async () => ({ access_token: 'renewed', expires_in: 3600 }) };
   });
   assert.equal(await graphAuth.token(), 'renewed');
+});
+
+test('matching email bodies are fetched as plain text using immutable message IDs', async () => {
+  const body = await readMessageBody(auth, 'message/id+123=', async (url, options) => {
+    const parsed = new URL(url);
+    assert.equal(parsed.pathname, '/v1.0/me/messages/message%2Fid%2B123%3D');
+    assert.equal(parsed.searchParams.get('$select'), 'body');
+    assert.equal(options.headers.Prefer, 'IdType="ImmutableId", outlook.body-content-type="text"');
+    assert.equal(options.headers.Authorization, 'Bearer test-token');
+    return { status: 200, result: { body: { contentType: 'text', content: 'Checkout is unavailable.' } } };
+  });
+  assert.equal(body, 'Checkout is unavailable.');
+  await assert.rejects(readMessageBody(auth, 'id', async () => ({ status: 403, result: {} })), /Mail.Read permission/);
+  await assert.rejects(readMessageBody(auth, 'id', async () => ({ status: 200, result: {} })), /plain-text email body/);
+});
+
+test('body retrieval failures remain queued and cached content survives Jira retries', async t => {
+  const { file, state } = await fixture(t);
+  state.pending = [
+    { id: 'wrong-group', subject: incidentSubject('INC1', 'Other Services') },
+    { id: 'valid', subject: incidentSubject() },
+  ];
+  let bodyReads = 0;
+  let submissions = 0;
+  const submit = async email => {
+    submissions++;
+    assert.equal(email.body, 'Checkout is unavailable.');
+    if (submissions === 1) throw new Error('Temporary Jira failure');
+    return { key: 'TEST-1', summary: 'Checkout outage', url: 'test' };
+  };
+  const readBody = async id => {
+    assert.equal(id, 'valid');
+    if (++bodyReads === 1) throw new Error('Graph unavailable');
+    return 'Checkout is unavailable.';
+  };
+  await processPending(state, file, submit, readBody);
+  assert.equal(submissions, 0);
+  assert.equal(state.pending.length, 1);
+  await processPending(state, file, submit, readBody);
+  const resumed = await loadState(file, 'client', 'tenant');
+  assert.equal(resumed.pending[0].body, 'Checkout is unavailable.');
+  await processPending(resumed, file, submit, readBody);
+  assert.equal(submissions, 2);
+  assert.equal(bodyReads, 2);
+  assert.equal(resumed.pending.length, 0);
 });

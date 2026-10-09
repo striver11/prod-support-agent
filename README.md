@@ -3,7 +3,7 @@
 This repository contains two Node.js command-line agents:
 
 - The ServiceNow agent uses Gemini to create, update, close, or retrieve ServiceNow Catalog Tasks from a natural-language command.
-- The Jira agent uses Gemini to draft and create a Jira Story or Bug from email text and an existing ServiceNow Incident or Catalog Task.
+- The Jira agent searches indexed knowledge articles using email content, then uses Gemini to draft and create a Jira Story or Bug. Direct ServiceNow ticket lookup is temporarily disabled.
 
 The Jira flow accepts email text from configuration or the command line. The Outlook watcher invokes it automatically only for new Inbox subjects reporting an `INC...` incident assigned to `Infra Services` (case insensitive).
 
@@ -11,7 +11,7 @@ The Jira flow accepts email text from configuration or the command line. The Out
 
 - Node.js 22 or later
 - Python 3 for running Chroma locally without Docker
-- A ServiceNow instance with read access to the `incident` table for Outlook notifications, and API access to `sc_task` for Catalog Tasks; vector indexing also requires read access to `kb_knowledge`
+- ServiceNow access for Catalog Task commands and knowledge-article indexing. The email-to-Jira flow uses the existing vector index without looking up a ServiceNow ticket.
 - For ServiceNow commands and Jira creation: a Gemini API key
 - For Jira creation: a Jira Cloud API token
 
@@ -67,7 +67,6 @@ JIRA_EMAIL=you@example.com
 JIRA_API_TOKEN=your-jira-api-token
 JIRA_PROJECT_KEY=YOURPROJECT
 # Optional override: Story or Bug. Leave unset for Ollama classification.
-SNOW_TICKET_NUMBER=SCTASK0012345
 EMAIL_TEXT="Customer reports that checkout fails after payment."
 ```
 
@@ -128,7 +127,7 @@ The Jira flow requires the Chroma server and Ollama to be running, and the index
 npm --prefix agent/servicenow-agent run start:jira
 ```
 
-It retrieves the ServiceNow ticket, searches the Chroma index, uses Ollama for automatic Story/Bug classification, sends the email, ticket, and matching articles to Gemini to draft the Jira summary and description, and creates the selected Jira issue type. For manual runs, if `SNOW_TICKET_NUMBER` is omitted, it tries to find an `INC` or `SCTASK` number in `EMAIL_TEXT`. Incident numbers query the `incident` table; Catalog Task numbers query `sc_task`. Every successful manual run creates a new Jira issue; duplicate-email tracking is provided by the Outlook watcher below.
+It searches the Chroma knowledge-article index using the email content, prints related articles, uses Ollama for automatic Story/Bug classification, and sends the email plus matching articles to Gemini to draft the Jira summary and description. Direct ServiceNow ticket lookup is commented out for now. An INC or SCTASK number found in manual email text is retained only as a source reference; a ticket number is not required for manual runs, and `SNOW_TICKET_NUMBER` is unused. Every successful manual run creates a new Jira issue; duplicate-email tracking is provided by the Outlook watcher below.
 
 Jira Cloud authentication uses your Atlassian account email and an API token. Create a token in your Atlassian account security settings. Keep it private.
 
@@ -142,7 +141,7 @@ Jira Cloud authentication uses your Atlassian account email and an API token. Cr
 [Action Required]: Incident INC838294 has been assigned to Infra Services
 ```
 
-The watcher extracts `INC838294` from the subject and requires the assigned group to be exactly `Infra Services`, ignoring case and extra whitespace. Subjects for other groups, without an INC number, or containing only a generic incident keyword are skipped. The full subject is passed as `emailText` to `createJiraFromEmail`. Mail bodies are not read. The Jira agent retrieves the corresponding ServiceNow Incident and drafts the Jira issue using the subject, incident details, and knowledge articles.
+The watcher extracts `INC838294` from the subject and requires the assigned group to be exactly `Infra Services`, ignoring case and extra whitespace. Subjects for other groups, without an INC number, or containing only a generic incident keyword are skipped. For matching emails, it fetches the full plain-text body from Microsoft Graph and passes the subject plus body as `emailText` to `createJiraFromEmail`. This content drives the similarity search over the existing knowledge-article index, classification, and Jira drafting. No direct ServiceNow Incident lookup is performed. Attachments are not read.
 
 Add the Outlook settings to `agent/.env`, alongside the existing Jira, ServiceNow, and Gemini settings:
 
@@ -151,7 +150,7 @@ OUTLOOK_CLIENT_ID=your-microsoft-app-client-id
 OUTLOOK_TENANT=common
 ```
 
-Use the Microsoft app registration from the Python reader, with public client/device-code authentication enabled and delegated Microsoft Graph `Mail.ReadBasic` permission. `OUTLOOK_TENANT` can be your tenant ID, `organizations`, `consumers`, or `common`, as appropriate for the registration.
+Use the Microsoft app registration from the Python reader, with public client/device-code authentication enabled and delegated Microsoft Graph `Mail.Read` permission. The previous `Mail.ReadBasic` permission excludes email bodies. Restart the watcher and consent to `Mail.Read` when prompted; if consent is blocked, add this delegated permission in the app registration and have your administrator grant it as required by your tenant. See [Microsoft Graph permissions](https://learn.microsoft.com/en-us/graph/permissions-reference#mailread). `OUTLOOK_TENANT` can be your tenant ID, `organizations`, `consumers`, or `common`, as appropriate for the registration.
 
 With the existing Jira dependencies and services configured above, run from the repository root:
 
@@ -169,9 +168,9 @@ The watcher automatically loads `agent/.env` relative to its script location. En
 
 The watcher opens the Microsoft sign-in page in your default browser automatically. Enter the device code printed in the terminal when prompted, then sign in to the mailbox. If the browser cannot open, use the printed URL manually. Leave the watcher running; stop with Ctrl+C. Tokens refresh in memory, and a restart requires signing in again.
 
-The mail watcher always uses the INC number extracted from the assignment subject. It does not use `SNOW_TICKET_NUMBER` or `EMAIL_TEXT` from `.env`; those settings remain available for manual Jira commands. The ServiceNow account must be able to read the matching record in the `incident` table.
+The mail watcher retains the INC number from the assignment subject as a source reference only. It does not use `SNOW_TICKET_NUMBER` or `EMAIL_TEXT` from `.env`. Manual Jira commands still accept `EMAIL_TEXT`.
 
-On its first run, the watcher skips mail received before startup. It saves the Inbox cursor, seen message IDs, and pending incident subjects in the Git-ignored `outlook-jira.state.json`. Completed messages are skipped across restarts, and failed submissions retry on later polls without blocking other queued messages. Keep this file to preserve progress. It is separate from the Python reader's state. Use `--state-file path` for a separate mailbox, and run only one watcher per mailbox/state file. Custom state files contain subjects and should also be Git-ignored.
+On its first run, the watcher skips mail received before startup. It saves the Inbox cursor, seen message IDs, and pending incident subjects in the Git-ignored `outlook-jira.state.json`. Bodies are fetched only for matching queued messages and cached there until successful Jira creation, including for subjects queued by earlier versions. Body-read failures stay queued and do not trigger Jira using only a subject. Completed messages are skipped across restarts, and failed submissions retry on later polls without blocking other queued messages. Keep this file to preserve progress. It is separate from the Python reader's state. Use `--state-file path` for a separate mailbox, and run only one watcher per mailbox/state file. Custom state files contain email subjects and bodies and should also be Git-ignored.
 
 Each completed Inbox check logs counts for new emails read, subjects containing the incident keyword, matching Infra Services assignments, existing mail skipped, and queued messages. Counts cover all pages of that check and exclude duplicate/deleted messages. An idle check reports zero new emails. For example:
 
@@ -187,7 +186,7 @@ There is a small duplicate risk if Jira creates an issue but the response is los
 Run the automated watcher checks without contacting Outlook or Jira:
 
 ```powershell
-node --test readmail.test.js agent/servicenow-agent/servicenow.test.js
+node --test readmail.test.js agent/servicenow-agent/servicenow.test.js agent/servicenow-agent/jira-agent.test.js
 ```
 
 ### Calling the Jira agent from other integrations
@@ -199,7 +198,7 @@ import { createJiraFromEmail } from "./agent/servicenow-agent/jira-agent.js";
 
 const issue = await createJiraFromEmail({
   emailText: email.textBody,
-  serviceNowTicketNumber: email.serviceNowTicketNumber,
+  serviceNowTicketNumber: email.serviceNowTicketNumber, // Optional reference, no lookup.
   issueType: classification.issueType,
 });
 ```
@@ -208,7 +207,8 @@ When `issueType` is omitted, the agent retrieves relevant articles from Chroma a
 
 ## Troubleshooting
 
-- **ServiceNow ticket not found:** Confirm the ticket exists in the configured instance. `INC...` numbers query the `incident` table; `SCTASK...` numbers query `sc_task`.
+- **Cannot read email body:** Grant delegated Microsoft Graph `Mail.Read` permission and restart the watcher to sign in again. Existing Inbox cursors and queued emails can be kept.
+- **ServiceNow ticket not found in standalone commands:** Confirm the ticket exists in the configured instance. Ticket lookup is currently disabled in the email-to-Jira flow.
 - **ServiceNow authentication or access error:** Verify the instance hostname, username, password, and API access to the relevant `incident` or `sc_task` table.
 - **Jira project or issue-type error:** Check the project key and confirm that the project supports the selected issue type.
 - **Gemini API error:** Verify the API key and model. A `503` may be temporary; retry after a short wait.
