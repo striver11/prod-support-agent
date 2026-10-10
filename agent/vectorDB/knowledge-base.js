@@ -21,11 +21,12 @@ function getCollection() {
   });
 }
 
-async function embedTexts(texts) {
+export async function embedTexts(texts, { truncate = true } = {}) {
   const response = await fetch(`${ollamaUrl}/api/embed`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: embeddingModel, input: texts }),
+    body: JSON.stringify({ model: embeddingModel, input: texts, truncate }),
+    signal: AbortSignal.timeout(120_000),
   });
   const result = await response.json().catch(() => ({}));
   if (!response.ok) {

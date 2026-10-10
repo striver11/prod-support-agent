@@ -15,7 +15,7 @@ function parseClassification(text) {
   return result.issueType;
 }
 
-export async function classifyEmail({ emailText, knowledgeArticles }) {
+export async function classifyEmail({ emailText, serviceNowTicket, knowledgeArticles }) {
   const response = await fetch(`${ollamaUrl}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -31,7 +31,7 @@ export async function classifyEmail({ emailText, knowledgeArticles }) {
         },
         {
           role: 'user',
-          content: JSON.stringify({ email: emailText, knowledgeArticles }),
+          content: JSON.stringify({ email: emailText, serviceNowTicket, knowledgeArticles }),
         },
       ],
     }),

@@ -1,9 +1,9 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { mkdtemp, rm } = require('node:fs/promises');
+const { mkdtemp, rm, readFile, rename, readdir, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
-const { isIncident, parseIncidentAssignment, loadState, pollInbox, processPending, readMessageBody, submitIncident, validDeltaUrl, GraphAuth } = require('./readmail.js');
+const { isIncident, parseIncidentAssignment, loadState, saveState, pollInbox, processPending, readMessageBody, submitIncident, validDeltaUrl, GraphAuth } = require('./readmail.js');
 
 const delta = 'https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta';
 const auth = { token: async () => 'test-token' };
@@ -15,6 +15,53 @@ async function fixture(t) {
   t.after(() => rm(dir, { recursive: true, force: true }));
   const file = path.join(dir, 'state.json');
   return { file, state: await loadState(file, 'client', 'tenant') };
+}
+
+test('state save retries temporary Windows locks and preserves the old file until replacement succeeds', async t => {
+  const { file, state } = await fixture(t);
+  const before = await readFile(file, 'utf8');
+  // A .tmp left by the old implementation must not interfere with the new save.
+  await writeFile(`${file}.tmp`, 'stale temporary file');
+  state.pending.push({ id: 'queued', subject: incidentSubject() });
+  const delays = [];
+  const temporaryFiles = new Set();
+  let attempts = 0;
+  t.mock.method(console, 'warn', () => {});
+  await saveState(file, state, {
+    wait: async delay => delays.push(delay),
+    renameFile: async (source, destination) => {
+      assert.equal(await readFile(file, 'utf8'), before);
+      assert.equal(destination, file);
+      assert.notEqual(source, `${file}.tmp`);
+      temporaryFiles.add(source);
+      if (attempts++ < 3) throw Object.assign(new Error('File locked'), { code: ['EPERM', 'EACCES', 'EBUSY'][attempts - 1] });
+      await rename(source, destination);
+    },
+  });
+  assert.deepEqual(delays, [100, 200, 400]);
+  assert.equal(temporaryFiles.size, 1);
+  assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), state);
+  assert.equal(await readFile(`${file}.tmp`, 'utf8'), 'stale temporary file');
+  assert.deepEqual((await readdir(path.dirname(file))).sort(), ['state.json', 'state.json.tmp']);
+});
+
+for (const code of ['EPERM', 'ENOSPC']) {
+  test(`failed state replacement (${code}) keeps the saved queue intact and stops safely`, async t => {
+    const { file, state } = await fixture(t);
+    const before = await readFile(file, 'utf8');
+    state.pending.push({ id: 'queued', subject: incidentSubject() });
+    let attempts = 0;
+    const delays = [];
+    t.mock.method(console, 'warn', () => {});
+    await assert.rejects(saveState(file, state, {
+      wait: async delay => delays.push(delay),
+      renameFile: async () => { attempts++; throw Object.assign(new Error('Cannot replace file'), { code }); },
+    }), error => error.constructor.name === 'StateError' && error.cause.code === code);
+    assert.equal(attempts, code === 'EPERM' ? 7 : 1);
+    assert.equal(delays.reduce((total, delay) => total + delay, 0), code === 'EPERM' ? 6300 : 0);
+    assert.equal(await readFile(file, 'utf8'), before);
+    assert.deepEqual(await readdir(path.dirname(file)), ['state.json']);
+  });
 }
 
 test('incident keyword is case insensitive and respects word boundaries', () => {
@@ -263,6 +310,19 @@ test('expired access tokens refresh without interactive sign-in', async t => {
     return { status: 200, json: async () => ({ access_token: 'renewed', expires_in: 3600 }) };
   });
   assert.equal(await graphAuth.token(), 'renewed');
+});
+
+test('a duplicate Story completes the email queue item without reporting ticket creation', async t => {
+  const { file, state } = await fixture(t);
+  state.pending = [{ id: 'duplicate', subject: incidentSubject() }];
+  const logs = [];
+  t.mock.method(console, 'log', line => logs.push(line));
+  await processPending(state, file, async () => ({ outcome: 'duplicate', key: 'KAN-14', summary: 'Checkout outage', similarity: 0.85, status: 'In Progress', url: 'https://jira.example/browse/KAN-14' }));
+  const resumed = await loadState(file, 'client', 'tenant');
+  assert.equal(resumed.pending.length, 0);
+  await processPending(resumed, file, async () => assert.fail('Duplicate must not retry'));
+  assert.ok(logs.some(line => line.includes('already exists in Jira US KAN-14')));
+  assert.ok(!logs.some(line => line.includes('Created KAN-14')));
 });
 
 test('matching email bodies are fetched as plain text using immutable message IDs', async () => {

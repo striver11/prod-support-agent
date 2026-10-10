@@ -1,5 +1,6 @@
 // Watch Outlook and pass new incident subjects to the existing Jira agent.
-const { readFile, writeFile, rename } = require('node:fs/promises');
+const { readFile, writeFile, rename, unlink } = require('node:fs/promises');
+const { randomUUID } = require('node:crypto');
 const path = require('node:path');
 const { parseArgs } = require('node:util');
 const { setTimeout: sleep } = require('node:timers/promises');
@@ -140,13 +141,28 @@ function validDeltaUrl(value) {
   }
 }
 
-async function saveState(file, state) {
+async function saveState(file, state, { renameFile = rename, wait = sleep } = {}) {
+  // A separate file per save avoids colliding with stale .tmp files.
+  const temporaryFile = `${file}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    await writeFile(`${file}.tmp`, JSON.stringify(state, null, 2), { mode: 0o600 });
-    await rename(`${file}.tmp`, file);
+    await writeFile(temporaryFile, JSON.stringify(state, null, 2), { mode: 0o600, flag: 'wx', flush: true });
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await renameFile(temporaryFile, file);
+        break;
+      } catch (error) {
+        // Windows can briefly deny replacement while a scanner or reader has
+        // the file open. Never delete or overwrite the last good state in place.
+        if (!['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || attempt >= 6) throw error;
+        if (attempt === 0) console.warn(`State file replacement temporarily blocked (${error.code}); retrying for up to 6.3 seconds.`);
+        await wait(100 * 2 ** attempt);
+      }
+    }
   } catch (error) {
     // Stop on persistence failures: continuing could submit the same email twice.
-    throw new StateError(`Cannot save state file ${file}: ${error.message}`);
+    throw new StateError(`Cannot save state file ${file}: ${error.message}. Keep the existing state file; check folder permissions and that only one watcher is running.`, { cause: error });
+  } finally {
+    await unlink(temporaryFile).catch(() => {});
   }
 }
 
@@ -325,7 +341,8 @@ async function processPending(state, stateFile, submit = submitIncident, readBod
     }
     state.pending = state.pending.filter(item => item.id !== message.id);
     await saveState(stateFile, state);
-    console.log(`Created ${created.key}: ${created.summary}\n${created.url}`);
+    const { formatJiraOutcome } = await import('./agent/servicenow-agent/jira.js');
+    console.log(formatJiraOutcome(created));
   }
   if (state.pending.length) console.log(`Pending retries: ${state.pending.length}. Next attempt on the next Inbox check.`);
 }
@@ -367,7 +384,7 @@ async function main() {
   }
 }
 
-module.exports = { GraphAuth, isIncident, parseIncidentAssignment, loadState, pollInbox, processPending, readMessageBody, submitIncident, validDeltaUrl };
+module.exports = { GraphAuth, isIncident, parseIncidentAssignment, loadState, saveState, pollInbox, processPending, readMessageBody, submitIncident, validDeltaUrl };
 
 if (require.main === module) {
   main().catch(error => {
